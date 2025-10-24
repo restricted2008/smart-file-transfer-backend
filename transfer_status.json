@@ -1,0 +1,23 @@
+{
+  "transfers": {
+    "example.txt": {
+      "status": "completed",
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "encryption": false,
+      "priority": 0,
+      "created_at": "2024-10-24T07:50:00.000000",
+      "updated_at": "2024-10-24T07:50:05.000000"
+    }
+  },
+  "queue": [
+    {
+      "filename": "example.txt",
+      "priority": 0
+    }
+  ],
+  "metadata": {
+    "last_updated": "2024-10-24T07:50:00.000000",
+    "total_transfers": 1,
+    "version": "1.0"
+  }
+}

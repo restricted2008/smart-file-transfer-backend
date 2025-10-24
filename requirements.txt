@@ -1,0 +1,15 @@
+# Core HTTP Framework
+Flask==3.0.3
+Werkzeug==3.0.3
+
+# CORS support for frontend development
+Flask-CORS==4.0.0
+
+# HTTP client for testing and API calls
+requests==2.31.0
+
+# Cryptography library for AES encryption
+pycryptodome==3.20.0
+
+# Process monitoring for auto-restart
+psutil==5.9.8
