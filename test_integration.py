@@ -22,6 +22,7 @@ import sys
 import time
 import subprocess
 import json
+import hashlib
 from datetime import datetime
 
 
@@ -446,6 +447,173 @@ class IntegrationTest:
             self.print_fail(f"Test error: {e}")
             return False
     
+    def test_chunked_upload(self):
+        """Test chunked upload with resume capability."""
+        self.print_test("Chunked Upload Test")
+        
+        # Create 10MB test file
+        test_file = 'large_test.bin'
+        with open(test_file, 'wb') as f:
+            f.write(b'A' * (10 * 1024 * 1024))
+        
+        try:
+            # Upload in 1MB chunks
+            chunk_size = 1024 * 1024
+            total_size = os.path.getsize(test_file)
+            total_chunks = (total_size + chunk_size - 1) // chunk_size
+            
+            with open(test_file, 'rb') as f:
+                for i in range(total_chunks):
+                    chunk = f.read(chunk_size)
+                    chunk_hash = hashlib.sha256(chunk).hexdigest()
+                    
+                    response = requests.post(f'{self.url}/upload_chunk', 
+                        files={'chunk': chunk},
+                        data={
+                            'filename': 'large_test.bin',
+                            'chunk_number': i,
+                            'total_chunks': total_chunks,
+                            'chunk_hash': chunk_hash
+                        }
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        if result.get('success'):
+                            if result.get('status') == 'completed':
+                                self.print_pass("Chunked upload completed successfully")
+                                return True
+                        else:
+                            self.print_fail(f"Chunk upload failed: {result.get('error')}")
+                            return False
+                    else:
+                        self.print_fail(f"Chunk upload failed with status {response.status_code}")
+                        return False
+            
+            return True
+        
+        except Exception as e:
+            self.print_fail(f"Chunked upload test error: {e}")
+            return False
+        finally:
+            if os.path.exists(test_file):
+                os.remove(test_file)
+    
+    def test_live_progress(self):
+        """Test that progress updates during upload."""
+        self.print_test("Live Progress Test")
+        
+        # Create test file
+        test_file = 'progress_test.txt'
+        with open(test_file, 'w') as f:
+            f.write('Test content for progress tracking')
+        
+        try:
+            # Start upload
+            with open(test_file, 'rb') as f:
+                files = {'file': f}
+                data = {'filename': 'progress_test.txt'}
+                response = requests.post(f'{self.url}/upload', files=files, data=data)
+            
+            if response.status_code == 200:
+                # Check status for progress fields
+                status_response = requests.get(f'{self.url}/status/progress_test.txt')
+                if status_response.status_code == 200:
+                    status = status_response.json()
+                    if 'progress' in status and 'speed' in status:
+                        self.print_pass("Progress tracking fields present in status")
+                        return True
+                    else:
+                        self.print_fail("Progress tracking fields missing")
+                        return False
+                else:
+                    self.print_fail("Failed to get status")
+                    return False
+            else:
+                self.print_fail(f"Upload failed with status {response.status_code}")
+                return False
+        
+        except Exception as e:
+            self.print_fail(f"Progress test error: {e}")
+            return False
+        finally:
+            if os.path.exists(test_file):
+                os.remove(test_file)
+    
+    def test_client_tracking(self):
+        """Test client identification and tracking."""
+        self.print_test("Client Tracking Test")
+        
+        try:
+            # Upload a file to create client record
+            test_file = 'client_test.txt'
+            with open(test_file, 'w') as f:
+                f.write('Client tracking test')
+            
+            with open(test_file, 'rb') as f:
+                files = {'file': f}
+                data = {'filename': 'client_test.txt', 'client_id': 'test_client_123'}
+                response = requests.post(f'{self.url}/upload', files=files, data=data)
+            
+            if response.status_code == 200:
+                # Check clients endpoint
+                clients_response = requests.get(f'{self.url}/clients')
+                if clients_response.status_code == 200:
+                    clients = clients_response.json().get('clients', [])
+                    if clients:
+                        client = clients[0]
+                        if 'ip' in client and 'files' in client:
+                            self.print_pass("Client tracking working")
+                            return True
+                        else:
+                            self.print_fail("Client data incomplete")
+                            return False
+                    else:
+                        self.print_fail("No clients found")
+                        return False
+                else:
+                    self.print_fail("Failed to get clients")
+                    return False
+            else:
+                self.print_fail(f"Upload failed with status {response.status_code}")
+                return False
+        
+        except Exception as e:
+            self.print_fail(f"Client tracking test error: {e}")
+            return False
+        finally:
+            if os.path.exists(test_file):
+                os.remove(test_file)
+    
+    def test_network_ping(self):
+        """Test network quality ping endpoint."""
+        self.print_test("Network Ping Test")
+        
+        try:
+            import time
+            client_timestamp = time.time()
+            
+            response = requests.post(f'{self.url}/ping', 
+                json={'timestamp': client_timestamp})
+            
+            if response.status_code == 200:
+                result = response.json()
+                if 'latency_ms' in result and 'network_quality' in result:
+                    self.print_pass("Network ping successful")
+                    self.print_info(f"Latency: {result['latency_ms']:.2f}ms")
+                    self.print_info(f"Quality: {result['network_quality']}")
+                    return True
+                else:
+                    self.print_fail("Ping response incomplete")
+                    return False
+            else:
+                self.print_fail(f"Ping failed with status {response.status_code}")
+                return False
+        
+        except Exception as e:
+            self.print_fail(f"Ping test error: {e}")
+            return False
+    
     def run_all_tests(self):
         """Run all integration tests."""
         print(f"\n{TestColors.BOLD}{'='*70}{TestColors.ENDC}")
@@ -469,8 +637,12 @@ class IntegrationTest:
             self.test_download_encrypted_file,
             self.test_download_nonexistent_file,
             self.test_invalid_endpoint,
-            # Skip large file test by default (too slow)
+            self.test_live_progress,
+            self.test_client_tracking,
+            self.test_network_ping,
+            # Skip large file and chunked tests by default (too slow)
             # self.test_upload_large_file,
+            # self.test_chunked_upload,
         ]
         
         for test in tests:

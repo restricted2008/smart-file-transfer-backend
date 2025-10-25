@@ -55,6 +55,8 @@ import requests
 import os
 import sys
 import json
+import time
+import hashlib
 from datetime import datetime
 from config import SERVER_HOST, SERVER_PORT
 
@@ -108,6 +110,41 @@ def format_timestamp(iso_timestamp):
         return dt.strftime('%Y-%m-%d %H:%M:%S')
     except Exception:
         return iso_timestamp
+
+
+def upload_with_retry(file_path, max_retries=3, encryption=False, priority=0, filename=None, server_host=None, server_port=None):
+    """Upload file with automatic retry on failure."""
+    for attempt in range(max_retries):
+        try:
+            # Attempt upload
+            success = upload_file(file_path, encrypt=encryption, priority=priority, 
+                                filename=filename, server_host=server_host, server_port=server_port)
+            if success:
+                return True
+            
+            # Server error, retry
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                print_warning(f"Retry {attempt + 1}/{max_retries} in {delay}s...")
+                time.sleep(delay)
+            
+        except requests.exceptions.ConnectionError:
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt
+                print_warning(f"Connection error. Retry {attempt + 1}/{max_retries} in {delay}s...")
+                time.sleep(delay)
+            else:
+                print_error("Upload failed after all retries")
+                return False
+        
+        except requests.exceptions.Timeout:
+            if attempt < max_retries - 1:
+                print_warning(f"Timeout. Retry {attempt + 1}/{max_retries}...")
+            else:
+                print_error("Upload timeout after all retries")
+                return False
+    
+    return False
 
 
 def upload_file(file_path, encrypt=False, priority=0, filename=None, server_host=None, server_port=None):
@@ -218,6 +255,95 @@ def upload_file(file_path, encrypt=False, priority=0, filename=None, server_host
     
     except Exception as e:
         print_error(f"Upload error: {str(e)}")
+        return False
+
+
+def upload_chunked(file_path, chunk_size=1024*1024, encrypt=False, priority=0, filename=None, server_host=None, server_port=None):
+    """
+    Upload file in chunks with resume capability.
+    
+    Args:
+        file_path (str): Path to file to upload
+        chunk_size (int): Size of each chunk in bytes
+        encrypt (bool): Enable encryption
+        priority (int): Transfer priority
+        filename (str): Custom filename
+        server_host (str): Server host
+        server_port (int): Server port
+    """
+    host = server_host or SERVER_HOST
+    port = server_port or SERVER_PORT
+    
+    # Check if file exists
+    if not os.path.exists(file_path):
+        print_error(f"File not found: {file_path}")
+        return False
+    
+    file_size = os.path.getsize(file_path)
+    total_chunks = (file_size + chunk_size - 1) // chunk_size
+    
+    print_info(f"Uploading {file_path} in {total_chunks} chunks of {chunk_size} bytes each")
+    
+    # Check for existing chunks (resume capability)
+    resume_info = requests.get(f"http://{host}:{port}/resume_info/{filename or os.path.basename(file_path)}")
+    received_chunks = []
+    if resume_info.status_code == 200:
+        received_chunks = resume_info.json().get('received_chunks', [])
+        if received_chunks:
+            print_info(f"Resuming upload: {len(received_chunks)} chunks already received")
+    
+    try:
+        with open(file_path, 'rb') as f:
+            for i in range(total_chunks):
+                if i in received_chunks:
+                    print_info(f"Skipping chunk {i} (already received)")
+                    f.seek(i * chunk_size)
+                    continue
+                
+                # Read chunk
+                f.seek(i * chunk_size)
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                
+                # Calculate chunk hash
+                chunk_hash = hashlib.sha256(chunk).hexdigest()
+                
+                # Upload chunk
+                files = {'chunk': chunk}
+                data = {
+                    'filename': filename or os.path.basename(file_path),
+                    'chunk_number': str(i),
+                    'total_chunks': str(total_chunks),
+                    'chunk_hash': chunk_hash,
+                    'encryption': 'true' if encrypt else 'false',
+                    'priority': str(priority)
+                }
+                
+                response = requests.post(f"http://{host}:{port}/upload_chunk", files=files, data=data)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get('success'):
+                        progress = int(((i + 1) / total_chunks) * 100)
+                        print(f"\rProgress: {progress}%", end='', flush=True)
+                        
+                        if result.get('status') == 'completed':
+                            print()
+                            print_success("Chunked upload completed!")
+                            return True
+                    else:
+                        print_error(f"Chunk {i} upload failed: {result.get('error')}")
+                        return False
+                else:
+                    print_error(f"Chunk {i} upload failed with status {response.status_code}")
+                    return False
+        
+        print()
+        return True
+    
+    except Exception as e:
+        print_error(f"Chunked upload error: {str(e)}")
         return False
 
 
@@ -460,6 +586,9 @@ if __name__ == '__main__':
     upload_parser.add_argument('--encrypt', action='store_true', help='Encrypt file during upload')
     upload_parser.add_argument('--priority', type=int, default=0, help='Transfer priority (0-10)')
     upload_parser.add_argument('--filename', help='Custom filename on server')
+    upload_parser.add_argument('--retry', type=int, default=3, help='Number of retry attempts (default: 3)')
+    upload_parser.add_argument('--chunked', action='store_true', help='Use chunked upload with resume capability')
+    upload_parser.add_argument('--chunk-size', type=int, default=1024*1024, help='Chunk size for chunked upload (default: 1MB)')
     
     # Status command
     status_parser = subparsers.add_parser('status', help='Check transfer status')
@@ -484,14 +613,26 @@ if __name__ == '__main__':
     success = False
     
     if args.command == 'upload':
-        success = upload_file(
-            args.file,
-            encrypt=args.encrypt,
-            priority=args.priority,
-            filename=args.filename,
-            server_host=args.server,
-            server_port=args.port
-        )
+        if args.chunked:
+            success = upload_chunked(
+                args.file,
+                chunk_size=args.chunk_size,
+                encrypt=args.encrypt,
+                priority=args.priority,
+                filename=args.filename,
+                server_host=args.server,
+                server_port=args.port
+            )
+        else:
+            success = upload_with_retry(
+                args.file,
+                max_retries=args.retry,
+                encryption=args.encrypt,
+                priority=args.priority,
+                filename=args.filename,
+                server_host=args.server,
+                server_port=args.port
+            )
     
     elif args.command == 'status':
         success = get_status(

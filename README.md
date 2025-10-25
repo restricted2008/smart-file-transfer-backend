@@ -5,8 +5,13 @@ A secure, feature-rich file transfer server with encryption support, priority qu
 ## Features
 
 - 🔐 **AES-128-EAX Encryption** - Optional end-to-end file encryption
-- 📊 **Status Tracking** - Real-time transfer status and queue management
-- 🔄 **Auto-restart** - Automatic server recovery on crashes
+- 📊 **Live Progress Tracking** - Real-time upload/download progress with speed and ETA
+- 🧩 **Chunked Upload/Download** - Break large files into chunks with resume capability
+- 🔄 **Automatic Retry** - Exponential backoff retry logic for failed transfers
+- 👥 **Multi-Client Tracking** - Track which client uploaded/downloaded each file
+- 🌐 **Network Health Monitoring** - Detect unstable connections and adapt transfer strategy
+- ⚡ **Speed Tracking** - Display transfer speed in MB/s with network quality assessment
+- 💾 **Queue Persistence** - Transfer queue survives server restarts
 - 🎯 **Priority Queue** - Transfer priority management
 - 🔒 **Thread-safe** - Concurrent access with file locking
 - ✅ **Checksums** - SHA-256 file integrity verification
@@ -27,6 +32,7 @@ backend/
     ├── hash_util.py       # SHA-256 checksums
     ├── encrypt_util.py    # AES-128-EAX encryption
     ├── status_handler.py  # Thread-safe status management
+    ├── progress_tracker.py # Live progress tracking utilities
     └── auto_restart.py    # Auto-restart monitor
 ```
 
@@ -87,6 +93,16 @@ python client.py upload document.pdf
 **Upload with encryption:**
 ```bash
 python client.py upload secret.txt --encrypt --priority 5
+```
+
+**Upload with retry logic:**
+```bash
+python client.py upload large_file.zip --retry 5
+```
+
+**Chunked upload with resume:**
+```bash
+python client.py upload huge_file.zip --chunked --chunk-size 2097152
 ```
 
 **Check all transfers:**
@@ -182,10 +198,17 @@ Get status for a specific file.
 ```json
 {
   "filename": "document.pdf",
-  "status": "completed",
+  "status": "uploading",
   "checksum": "abc123...",
   "encryption": false,
   "priority": 0,
+  "progress": 45,
+  "speed": 5242880,
+  "eta": 120,
+  "transferred_bytes": 1048576,
+  "total_bytes": 10485760,
+  "client_ip": "192.168.1.100",
+  "retry_count": 0,
   "created_at": "2024-10-24T07:30:00",
   "updated_at": "2024-10-24T07:30:05"
 }
@@ -220,6 +243,89 @@ Health check endpoint.
 {
   "status": "ok",
   "timestamp": "2024-10-24T07:30:00Z"
+}
+```
+
+---
+
+### `POST /upload_chunk`
+Upload a single chunk of a file with progress tracking.
+
+**Request (multipart/form-data):**
+- `chunk`: File chunk (binary, required)
+- `filename`: Target filename (required)
+- `chunk_number`: Current chunk number 0-based (required)
+- `total_chunks`: Total number of chunks (required)
+- `chunk_hash`: SHA-256 hash of this chunk (required)
+- `client_id`: Optional custom client identifier
+
+**Response (200 OK):**
+```json
+{
+  "success": true,
+  "chunks_received": 5,
+  "status": "completed"
+}
+```
+
+**Errors:**
+- `400`: Missing required fields or chunk integrity check failed
+- `500`: Chunk upload failed
+
+---
+
+### `GET /resume_info/<filename>`
+Get which chunks have been received for resuming upload.
+
+**Response (200 OK):**
+```json
+{
+  "received_chunks": [0, 1, 2, 4],
+  "can_resume": true
+}
+```
+
+---
+
+### `GET /clients`
+Get list of all clients that have uploaded/downloaded files.
+
+**Response (200 OK):**
+```json
+{
+  "clients": [
+    {
+      "ip": "192.168.1.100",
+      "files": ["file1.txt", "file2.pdf"],
+      "total_uploads": 2,
+      "total_downloads": 0,
+      "last_activity": "2024-10-24T07:30:00",
+      "client_agent": "Mozilla/5.0...",
+      "client_id": "client_123"
+    }
+  ]
+}
+```
+
+---
+
+### `POST /ping`
+Client pings to measure latency and network quality.
+
+**Request (JSON):**
+```json
+{
+  "timestamp": 1698123456.789
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "server_timestamp": 1698123456.790,
+  "latency_ms": 1.2,
+  "network_quality": "excellent",
+  "recommended_chunk_size": 1048576
 }
 ```
 
@@ -267,6 +373,10 @@ The integration tests verify:
 ✅ **Valid Requests:**
 - File upload (unencrypted)
 - File upload with encryption
+- Chunked upload with resume capability
+- Live progress tracking
+- Client identification and tracking
+- Network quality monitoring
 - Status retrieval (all and specific)
 - File download (unencrypted)
 - File download with decryption
@@ -1000,6 +1110,18 @@ MIT License - see LICENSE file for details.
 For issues, questions, or contributions, please open an issue or submit a pull request.
 
 ## Changelog
+
+### v2.0.0 (2024-10-25)
+- 🆕 **Live Progress Tracking** - Real-time upload/download progress with speed and ETA
+- 🆕 **Chunked Upload/Download** - Break large files into chunks with resume capability
+- 🆕 **Automatic Retry** - Exponential backoff retry logic for failed transfers
+- 🆕 **Multi-Client Tracking** - Track which client uploaded/downloaded each file
+- 🆕 **Network Health Monitoring** - Detect unstable connections and adapt transfer strategy
+- 🆕 **Speed Tracking** - Display transfer speed in MB/s with network quality assessment
+- 🆕 **Queue Persistence** - Transfer queue survives server restarts
+- 🆕 **New API Endpoints** - `/upload_chunk`, `/resume_info`, `/clients`, `/ping`
+- 🆕 **Enhanced CLI** - New options for retry, chunked upload, and progress tracking
+- 🆕 **Comprehensive Testing** - Updated test suite for all new features
 
 ### v1.0.0 (2024-10-24)
 - Initial release

@@ -169,16 +169,27 @@ class StatusHandler:
                     pass
             raise
     
-    def update_status(self, filename, status, checksum=None, encryption=False, priority=0):
+    def update_status(self, filename, status, checksum=None, encryption=False, priority=0, 
+                     progress=None, speed=None, eta=None, transferred_bytes=None, total_bytes=None,
+                     client_ip=None, client_agent=None, client_id=None, retry_count=0):
         """
-        Thread-safe update of transfer status with timestamps.
+        Thread-safe update of transfer status with timestamps and progress tracking.
         
         Args:
             filename (str): Name of the file being transferred
-            status (str): Transfer status (pending, processing, completed, failed)
+            status (str): Transfer status (pending, processing, completed, failed, uploading, downloading)
             checksum (str, optional): SHA-256 checksum of the file
             encryption (bool): Whether the file is encrypted
             priority (int): Transfer priority (higher = more important)
+            progress (int, optional): Progress percentage (0-100)
+            speed (float, optional): Transfer speed in bytes/sec
+            eta (int, optional): Estimated time remaining in seconds
+            transferred_bytes (int, optional): Bytes transferred so far
+            total_bytes (int, optional): Total file size in bytes
+            client_ip (str, optional): Client IP address
+            client_agent (str, optional): Client user agent
+            client_id (str, optional): Custom client identifier
+            retry_count (int, optional): Number of retry attempts
         
         Returns:
             bool: True if successful, False otherwise
@@ -200,6 +211,26 @@ class StatusHandler:
                     
                     data['transfers'][filename]['encryption'] = encryption
                     data['transfers'][filename]['priority'] = priority
+                    
+                    # Update progress tracking fields
+                    if progress is not None:
+                        data['transfers'][filename]['progress'] = progress
+                    if speed is not None:
+                        data['transfers'][filename]['speed'] = speed
+                    if eta is not None:
+                        data['transfers'][filename]['eta'] = eta
+                    if transferred_bytes is not None:
+                        data['transfers'][filename]['transferred_bytes'] = transferred_bytes
+                    if total_bytes is not None:
+                        data['transfers'][filename]['total_bytes'] = total_bytes
+                    if client_ip is not None:
+                        data['transfers'][filename]['client_ip'] = client_ip
+                    if client_agent is not None:
+                        data['transfers'][filename]['client_agent'] = client_agent
+                    if client_id is not None:
+                        data['transfers'][filename]['client_id'] = client_id
+                    if retry_count is not None:
+                        data['transfers'][filename]['retry_count'] = retry_count
                 else:
                     # Create new transfer entry
                     data['transfers'][filename] = {
@@ -208,8 +239,28 @@ class StatusHandler:
                         'encryption': encryption,
                         'priority': priority,
                         'created_at': current_time,
-                        'updated_at': current_time
+                        'updated_at': current_time,
+                        'retry_count': retry_count
                     }
+                    
+                    # Add progress tracking fields if provided
+                    if progress is not None:
+                        data['transfers'][filename]['progress'] = progress
+                    if speed is not None:
+                        data['transfers'][filename]['speed'] = speed
+                    if eta is not None:
+                        data['transfers'][filename]['eta'] = eta
+                    if transferred_bytes is not None:
+                        data['transfers'][filename]['transferred_bytes'] = transferred_bytes
+                    if total_bytes is not None:
+                        data['transfers'][filename]['total_bytes'] = total_bytes
+                    if client_ip is not None:
+                        data['transfers'][filename]['client_ip'] = client_ip
+                    if client_agent is not None:
+                        data['transfers'][filename]['client_agent'] = client_agent
+                    if client_id is not None:
+                        data['transfers'][filename]['client_id'] = client_id
+                    
                     data['metadata']['total_transfers'] += 1
                 
                 self._write_data(data)

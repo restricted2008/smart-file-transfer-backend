@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os
 import sys
+import time
 import traceback
 from datetime import datetime
 from werkzeug.utils import secure_filename
@@ -26,6 +27,7 @@ from config import (
 from utils.hash_util import file_checksum
 from utils.encrypt_util import encrypt_data, decrypt_data
 from utils.status_handler import StatusHandler
+from utils.progress_tracker import ProgressTracker, NetworkMonitor, format_speed, format_eta
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -42,8 +44,9 @@ CORS(app, resources={
 # Configure max upload size
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 
-# Initialize status handler
+# Initialize status handler and network monitor
 status_handler = StatusHandler()
+network_monitor = NetworkMonitor()
 
 
 def log_error(message, exception=None):
@@ -58,6 +61,90 @@ def log_info(message):
     """Log info messages with timestamp."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] INFO: {message}")
+
+
+def upload_with_progress(file_stream, filename, total_size, client_ip=None, client_agent=None, client_id=None):
+    """
+    Upload file with real-time progress tracking.
+    
+    Args:
+        file_stream: File stream from request
+        filename (str): Name of the file
+        total_size (int): Total file size in bytes
+        client_ip (str): Client IP address
+        client_agent (str): Client user agent
+        client_id (str): Custom client identifier
+        
+    Returns:
+        tuple: (success, file_path, error_message)
+    """
+    chunk_size = 8192  # 8KB chunks
+    received = 0
+    start_time = time.time()
+    
+    # Initialize progress tracker
+    progress_tracker = ProgressTracker(filename, total_size)
+    
+    # Update initial status
+    status_handler.update_status(
+        filename=filename,
+        status='uploading',
+        client_ip=client_ip,
+        client_agent=client_agent,
+        client_id=client_id,
+        total_bytes=total_size,
+        transferred_bytes=0,
+        progress=0,
+        speed=0,
+        eta=0
+    )
+    
+    # Save to temporary location first
+    temp_filepath = os.path.join(TEMP_PATH, filename)
+    
+    try:
+        with open(temp_filepath, 'wb') as f:
+            while True:
+                chunk = file_stream.read(chunk_size)
+                if not chunk:
+                    break
+                
+                f.write(chunk)
+                received += len(chunk)
+                
+                # Update progress every 256KB or 5% of file
+                if received % (256 * 1024) == 0 or received % max(1, total_size // 20) == 0:
+                    progress_data = progress_tracker.update(received)
+                    
+                    # Update status with progress
+                    status_handler.update_status(
+                        filename=filename,
+                        status='uploading',
+                        progress=progress_data['progress'],
+                        speed=progress_data['speed'],
+                        eta=progress_data['eta'],
+                        transferred_bytes=received,
+                        total_bytes=total_size
+                    )
+        
+        # Final progress update
+        final_progress = progress_tracker.update(received)
+        status_handler.update_status(
+            filename=filename,
+            status='uploading',
+            progress=final_progress['progress'],
+            speed=final_progress['speed'],
+            eta=final_progress['eta'],
+            transferred_bytes=received,
+            total_bytes=total_size
+        )
+        
+        log_info(f"Upload progress complete: {filename} ({received}/{total_size} bytes)")
+        return True, temp_filepath, None
+        
+    except Exception as e:
+        log_error(f"Upload progress failed for {filename}", e)
+        return False, None, str(e)
 
 
 @app.route('/health', methods=['GET'])
@@ -149,6 +236,11 @@ def upload_file():
         except (ValueError, TypeError):
             priority = 0
         
+        # Capture client information
+        client_ip = request.remote_addr
+        client_agent = request.headers.get('User-Agent', 'Unknown')
+        client_id = request.form.get('client_id', client_ip)
+        
         # Determine final filename (sanitize for security)
         if custom_filename:
             filename = secure_filename(custom_filename)
@@ -169,12 +261,29 @@ def upload_file():
         if encryption_enabled:
             os.makedirs(ENCRYPTED_PATH, exist_ok=True)
         
-        # Save to temporary location first
-        temp_filepath = os.path.join(TEMP_PATH, filename)
-        file.save(temp_filepath)
+        # Get file size from Content-Length header if available
+        content_length = request.headers.get('Content-Length')
+        if content_length:
+            file_size = int(content_length)
+        else:
+            # Fallback: save to temp and check size
+            temp_filepath = os.path.join(TEMP_PATH, filename)
+            file.save(temp_filepath)
+            file_size = os.path.getsize(temp_filepath)
+            os.remove(temp_filepath)  # Remove temp file, we'll use progress tracking
         
-        # Check file size after saving
-        file_size = os.path.getsize(temp_filepath)
+        # Use progress tracking for upload
+        success, temp_filepath, error_msg = upload_with_progress(
+            file, filename, file_size, client_ip, client_agent, client_id
+        )
+        
+        if not success:
+            return jsonify({
+                'success': False,
+                'error': f'Upload failed: {error_msg}'
+            }), 500
+        
+        # Check file size after upload
         if file_size > MAX_FILE_SIZE:
             os.remove(temp_filepath)
             log_error(f"File too large: {file_size} bytes (max: {MAX_FILE_SIZE})")
@@ -238,13 +347,19 @@ def upload_file():
             os.rename(temp_filepath, final_filepath)
             log_info(f"File saved (unencrypted): {filename}")
         
-        # Update status handler
+        # Update status handler with final completion
         status_handler.update_status(
             filename=filename,
             status='completed',
             checksum=file_hash,
             encryption=encryption_enabled,
-            priority=priority
+            priority=priority,
+            client_ip=client_ip,
+            client_agent=client_agent,
+            client_id=client_id,
+            progress=100,
+            transferred_bytes=file_size,
+            total_bytes=file_size
         )
         
         # Add to queue if priority is set
@@ -275,6 +390,184 @@ def upload_file():
             'success': False,
             'error': f'Internal server error: {str(e)}'
         }), 500
+
+
+@app.route('/upload_chunk', methods=['POST'])
+def upload_chunk():
+    """
+    Upload a single chunk of a file with progress tracking.
+    
+    Form data:
+        - chunk: file chunk (binary)
+        - filename: target filename
+        - chunk_number: current chunk (0-based)
+        - total_chunks: total number of chunks
+        - chunk_hash: SHA-256 of this chunk (for integrity)
+        - client_id: Optional custom client identifier
+    
+    Returns:
+        JSON: {
+            success: Boolean,
+            chunks_received: Integer,
+            status: String (if all chunks received)
+        }
+    """
+    try:
+        # Validate required fields
+        if 'chunk' not in request.files:
+            return jsonify({'error': 'No chunk provided'}), 400
+        
+        chunk_file = request.files['chunk']
+        filename = request.form.get('filename')
+        chunk_number = request.form.get('chunk_number')
+        total_chunks = request.form.get('total_chunks')
+        chunk_hash = request.form.get('chunk_hash')
+        client_id = request.form.get('client_id', request.remote_addr)
+        
+        if not all([filename, chunk_number, total_chunks, chunk_hash]):
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        try:
+            chunk_number = int(chunk_number)
+            total_chunks = int(total_chunks)
+        except ValueError:
+            return jsonify({'error': 'Invalid chunk_number or total_chunks'}), 400
+        
+        # Verify chunk integrity
+        chunk_data = chunk_file.read()
+        import hashlib
+        received_hash = hashlib.sha256(chunk_data).hexdigest()
+        if received_hash != chunk_hash:
+            return jsonify({'error': 'Chunk integrity check failed'}), 400
+        
+        # Save chunk to temp directory
+        chunk_dir = os.path.join(UPLOAD_DIR, 'chunks', filename)
+        os.makedirs(chunk_dir, exist_ok=True)
+        chunk_path = os.path.join(chunk_dir, f'chunk_{chunk_number}')
+        
+        with open(chunk_path, 'wb') as f:
+            f.write(chunk_data)
+        
+        # Update progress
+        progress = int(((chunk_number + 1) / total_chunks) * 100)
+        status_handler.update_status(
+            filename=filename,
+            status='uploading',
+            progress=progress,
+            client_id=client_id,
+            client_ip=request.remote_addr,
+            client_agent=request.headers.get('User-Agent', 'Unknown')
+        )
+        
+        # Check if all chunks received
+        received_chunks = len([f for f in os.listdir(chunk_dir) if f.startswith('chunk_')])
+        if received_chunks == total_chunks:
+            # Assemble file
+            assemble_chunks(filename, chunk_dir, total_chunks)
+            return jsonify({'success': True, 'status': 'completed'}), 200
+        
+        return jsonify({'success': True, 'chunks_received': received_chunks}), 200
+    
+    except Exception as e:
+        log_error("Chunk upload error", e)
+        return jsonify({'error': f'Chunk upload failed: {str(e)}'}), 500
+
+
+def assemble_chunks(filename, chunk_dir, total_chunks):
+    """Combine all chunks into final file."""
+    final_path = os.path.join(UPLOAD_DIR, filename)
+    
+    with open(final_path, 'wb') as outfile:
+        for i in range(total_chunks):
+            chunk_path = os.path.join(chunk_dir, f'chunk_{i}')
+            with open(chunk_path, 'rb') as chunk:
+                outfile.write(chunk.read())
+    
+    # Cleanup chunks
+    import shutil
+    shutil.rmtree(chunk_dir)
+    
+    # Update status
+    status_handler.update_status(filename, 'completed', progress=100)
+
+
+@app.route('/resume_info/<filename>', methods=['GET'])
+def get_resume_info(filename):
+    """Get which chunks have been received for resuming upload."""
+    try:
+        chunk_dir = os.path.join(UPLOAD_DIR, 'chunks', filename)
+        
+        if not os.path.exists(chunk_dir):
+            return jsonify({'received_chunks': []}), 200
+        
+        received = sorted([
+            int(f.split('_')[1]) 
+            for f in os.listdir(chunk_dir) 
+            if f.startswith('chunk_')
+        ])
+        
+        return jsonify({
+            'received_chunks': received,
+            'can_resume': True
+        }), 200
+    
+    except Exception as e:
+        log_error(f"Resume info error for {filename}", e)
+        return jsonify({'error': f'Failed to get resume info: {str(e)}'}), 500
+
+
+@app.route('/clients', methods=['GET'])
+def get_active_clients():
+    """Get list of all clients that have uploaded/downloaded files."""
+    try:
+        all_status = status_handler.get_all_status()
+        clients = {}
+        
+        for filename, info in all_status.get('transfers', {}).items():
+            client_ip = info.get('client_ip', 'Unknown')
+            
+            if client_ip not in clients:
+                clients[client_ip] = {
+                    'ip': client_ip,
+                    'files': [],
+                    'total_uploads': 0,
+                    'total_downloads': 0,
+                    'last_activity': info.get('updated_at'),
+                    'client_agent': info.get('client_agent', 'Unknown'),
+                    'client_id': info.get('client_id', client_ip)
+                }
+            
+            clients[client_ip]['files'].append(filename)
+            if info.get('status') == 'completed':
+                clients[client_ip]['total_uploads'] += 1
+        
+        return jsonify({'clients': list(clients.values())}), 200
+    
+    except Exception as e:
+        log_error("Get clients error", e)
+        return jsonify({'error': f'Failed to get clients: {str(e)}'}), 500
+
+
+@app.route('/ping', methods=['POST'])
+def ping():
+    """Client pings to measure latency and network quality."""
+    try:
+        client_timestamp = float(request.json.get('timestamp', 0))
+        server_timestamp = time.time()
+        
+        latency_ms = (server_timestamp - client_timestamp) * 1000
+        network_monitor.add_latency(latency_ms)
+        
+        return jsonify({
+            'server_timestamp': server_timestamp,
+            'latency_ms': latency_ms,
+            'network_quality': network_monitor.get_quality(),
+            'recommended_chunk_size': network_monitor.get_recommended_chunk_size()
+        }), 200
+    
+    except Exception as e:
+        log_error("Ping error", e)
+        return jsonify({'error': f'Ping failed: {str(e)}'}), 500
 
 
 @app.route('/status', methods=['GET'])
