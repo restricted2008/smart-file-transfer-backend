@@ -613,6 +613,215 @@ class IntegrationTest:
         except Exception as e:
             self.print_fail(f"Ping test error: {e}")
             return False
+
+    def test_batch_upload(self):
+        """Test batch file upload."""
+        self.print_test("Batch Upload Test")
+        
+        try:
+            # Create test files
+            test_files = ['test1.txt', 'test2.txt', 'test3.txt']
+            for filename in test_files:
+                with open(filename, 'w') as f:
+                    f.write(f"Test content for {filename}")
+            
+            # Prepare files for upload
+            files = []
+            for filename in test_files:
+                files.append(('files', open(filename, 'rb')))
+            
+            # Upload batch
+            headers = {'X-API-Key': 'dev-key-123'}
+            response = requests.post(f'{self.url}/upload_batch', files=files, headers=headers)
+            
+            # Close files
+            for _, f in files:
+                f.close()
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success') and result.get('successful') == 3:
+                    self.print_pass("Batch upload successful")
+                    return True
+                else:
+                    self.print_fail(f"Batch upload failed: {result}")
+                    return False
+            else:
+                self.print_fail(f"Batch upload failed with status {response.status_code}")
+                return False
+                
+        except Exception as e:
+            self.print_fail(f"Batch upload test error: {e}")
+            return False
+        finally:
+            # Cleanup
+            for filename in test_files:
+                if os.path.exists(filename):
+                    os.remove(filename)
+
+    def test_transfer_cancellation(self):
+        """Test cancelling a transfer."""
+        self.print_test("Transfer Cancellation Test")
+        
+        try:
+            # Create a test file
+            test_file = 'cancel_test.txt'
+            with open(test_file, 'w') as f:
+                f.write('Test content for cancellation')
+            
+            # Cancel the transfer
+            headers = {'X-API-Key': 'dev-key-123'}
+            response = requests.post(f'{self.url}/cancel/{test_file}', headers=headers)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('success'):
+                    self.print_pass("Transfer cancellation successful")
+                    return True
+                else:
+                    self.print_fail(f"Cancellation failed: {result}")
+                    return False
+            else:
+                self.print_fail(f"Cancellation failed with status {response.status_code}")
+                return False
+                
+        except Exception as e:
+            self.print_fail(f"Transfer cancellation test error: {e}")
+            return False
+        finally:
+            if os.path.exists(test_file):
+                os.remove(test_file)
+
+    def test_authentication(self):
+        """Test API key authentication."""
+        self.print_test("Authentication Test")
+        
+        try:
+            # Test without API key (should fail)
+            response = requests.post(f'{self.url}/upload', files={'file': ('test.txt', 'content')})
+            if response.status_code == 401:
+                self.print_pass("Authentication required (no key)")
+            else:
+                self.print_fail("Authentication not enforced")
+                return False
+            
+            # Test with invalid API key (should fail)
+            headers = {'X-API-Key': 'invalid-key'}
+            response = requests.post(f'{self.url}/upload', files={'file': ('test.txt', 'content')}, headers=headers)
+            if response.status_code == 403:
+                self.print_pass("Invalid API key rejected")
+            else:
+                self.print_fail("Invalid API key not rejected")
+                return False
+            
+            # Test with valid API key (should work)
+            headers = {'X-API-Key': 'dev-key-123'}
+            with open('test_auth.txt', 'w') as f:
+                f.write('test content')
+            
+            with open('test_auth.txt', 'rb') as f:
+                response = requests.post(f'{self.url}/upload', files={'file': f}, headers=headers)
+            
+            if response.status_code == 200:
+                self.print_pass("Valid API key accepted")
+                return True
+            else:
+                self.print_fail(f"Valid API key rejected: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            self.print_fail(f"Authentication test error: {e}")
+            return False
+        finally:
+            if os.path.exists('test_auth.txt'):
+                os.remove('test_auth.txt')
+
+    def test_statistics(self):
+        """Test statistics endpoint."""
+        self.print_test("Statistics Test")
+        
+        try:
+            response = requests.get(f'{self.url}/stats')
+            
+            if response.status_code == 200:
+                stats = response.json()
+                required_fields = ['total_transfers', 'total_bytes', 'completed_count', 'failed_count']
+                
+                if all(field in stats for field in required_fields):
+                    self.print_pass("Statistics endpoint working")
+                    return True
+                else:
+                    self.print_fail("Missing statistics fields")
+                    return False
+            else:
+                self.print_fail(f"Statistics request failed: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            self.print_fail(f"Statistics test error: {e}")
+            return False
+
+    def test_history(self):
+        """Test transfer history endpoint."""
+        self.print_test("History Test")
+        
+        try:
+            response = requests.get(f'{self.url}/history')
+            
+            if response.status_code == 200:
+                result = response.json()
+                if 'transfers' in result and 'total_count' in result:
+                    self.print_pass("History endpoint working")
+                    return True
+                else:
+                    self.print_fail("Missing history fields")
+                    return False
+            else:
+                self.print_fail(f"History request failed: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            self.print_fail(f"History test error: {e}")
+            return False
+
+    def test_metadata(self):
+        """Test file metadata endpoint."""
+        self.print_test("Metadata Test")
+        
+        try:
+            # First upload a file
+            with open('test_meta.txt', 'w') as f:
+                f.write('test content for metadata')
+            
+            headers = {'X-API-Key': 'dev-key-123'}
+            with open('test_meta.txt', 'rb') as f:
+                upload_response = requests.post(f'{self.url}/upload', files={'file': f}, headers=headers)
+            
+            if upload_response.status_code == 200:
+                # Get metadata
+                response = requests.get(f'{self.url}/metadata/test_meta.txt')
+                
+                if response.status_code == 200:
+                    metadata = response.json()
+                    if 'size' in metadata and 'mime_type' in metadata:
+                        self.print_pass("Metadata endpoint working")
+                        return True
+                    else:
+                        self.print_fail("Missing metadata fields")
+                        return False
+                else:
+                    self.print_fail(f"Metadata request failed: {response.status_code}")
+                    return False
+            else:
+                self.print_fail("Failed to upload test file for metadata")
+                return False
+                
+        except Exception as e:
+            self.print_fail(f"Metadata test error: {e}")
+            return False
+        finally:
+            if os.path.exists('test_meta.txt'):
+                os.remove('test_meta.txt')
     
     def run_all_tests(self):
         """Run all integration tests."""
@@ -640,6 +849,12 @@ class IntegrationTest:
             self.test_live_progress,
             self.test_client_tracking,
             self.test_network_ping,
+            self.test_batch_upload,
+            self.test_transfer_cancellation,
+            self.test_authentication,
+            self.test_statistics,
+            self.test_history,
+            self.test_metadata,
             # Skip large file and chunked tests by default (too slow)
             # self.test_upload_large_file,
             # self.test_chunked_upload,

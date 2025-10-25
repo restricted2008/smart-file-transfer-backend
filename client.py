@@ -60,6 +60,9 @@ import hashlib
 from datetime import datetime
 from config import SERVER_HOST, SERVER_PORT
 
+# API Key for authentication
+API_KEY = os.environ.get('API_KEY', 'dev-key-123')
+
 
 class Colors:
     """ANSI color codes for terminal output."""
@@ -193,9 +196,12 @@ def upload_file(file_path, encrypt=False, priority=0, filename=None, server_host
             if filename:
                 data['filename'] = filename
             
+            # Prepare headers with API key
+            headers = {'X-API-Key': API_KEY}
+            
             # Send POST request
             print_info(f"Connecting to {url}...")
-            response = requests.post(url, files=files, data=data, timeout=30)
+            response = requests.post(url, files=files, data=data, headers=headers, timeout=30)
         
         # Handle response
         if response.status_code == 200:
@@ -567,6 +573,191 @@ def health_check(server_host=None, server_port=None):
         return False
 
 
+def upload_batch(files, encrypt=False, priority=0, server_host=None, server_port=None):
+    """Upload multiple files in batch."""
+    host = server_host or SERVER_HOST
+    port = server_port or SERVER_PORT
+    url = f"http://{host}:{port}/upload_batch"
+    
+    print_info(f"Batch uploading {len(files)} files to {url}")
+    
+    try:
+        # Prepare files and headers
+        file_objects = []
+        for file_path in files:
+            if not os.path.exists(file_path):
+                print_error(f"File not found: {file_path}")
+                continue
+            file_objects.append(('files', open(file_path, 'rb')))
+        
+        headers = {'X-API-Key': API_KEY}
+        data = {
+            'encryption': 'true' if encrypt else 'false',
+            'priority': str(priority)
+        }
+        
+        response = requests.post(url, files=file_objects, data=data, headers=headers)
+        
+        # Close file objects
+        for _, f in file_objects:
+            f.close()
+        
+        if response.status_code == 200:
+            result = response.json()
+            print_success(f"Batch upload completed: {result['successful']}/{result['total_files']} successful")
+            
+            for file_result in result['results']:
+                if file_result['status'] == 'success':
+                    print_success(f"  ✓ {file_result['filename']} ({format_size(file_result['size'])})")
+                else:
+                    print_error(f"  ✗ {file_result['filename']}: {file_result['error']}")
+            
+            return True
+        else:
+            print_error(f"Batch upload failed: {response.status_code}")
+            return False
+            
+    except Exception as e:
+        print_error(f"Batch upload error: {e}")
+        return False
+
+
+def cancel_transfer(filename, server_host=None, server_port=None):
+    """Cancel an ongoing transfer."""
+    host = server_host or SERVER_HOST
+    port = server_port or SERVER_PORT
+    url = f"http://{host}:{port}/cancel/{filename}"
+    
+    print_info(f"Cancelling transfer: {filename}")
+    
+    try:
+        headers = {'X-API-Key': API_KEY}
+        response = requests.post(url, headers=headers)
+        
+        if response.status_code == 200:
+            result = response.json()
+            print_success(result['message'])
+            return True
+        else:
+            print_error(f"Cancel failed: {response.status_code}")
+            return False
+            
+    except Exception as e:
+        print_error(f"Cancel error: {e}")
+        return False
+
+
+def get_history(status=None, client=None, from_date=None, to_date=None, limit=100, server_host=None, server_port=None):
+    """Get transfer history with filters."""
+    host = server_host or SERVER_HOST
+    port = server_port or SERVER_PORT
+    url = f"http://{host}:{port}/history"
+    
+    params = {'limit': limit}
+    if status:
+        params['status'] = status
+    if client:
+        params['client'] = client
+    if from_date:
+        params['from'] = from_date
+    if to_date:
+        params['to'] = to_date
+    
+    print_info(f"Getting transfer history from {url}")
+    
+    try:
+        response = requests.get(url, params=params)
+        
+        if response.status_code == 200:
+            result = response.json()
+            print_success(f"Found {result['total_count']} transfers (showing {result['returned_count']})")
+            
+            for filename, details in result['transfers'].items():
+                status_icon = "✓" if details.get('status') == 'completed' else "✗" if details.get('status') == 'failed' else "⏳"
+                print(f"  {status_icon} {filename} - {details.get('status', 'unknown')} ({details.get('client_ip', 'unknown')})")
+            
+            return True
+        else:
+            print_error(f"History request failed: {response.status_code}")
+            return False
+            
+    except Exception as e:
+        print_error(f"History error: {e}")
+        return False
+
+
+def get_statistics(server_host=None, server_port=None):
+    """Get transfer statistics."""
+    host = server_host or SERVER_HOST
+    port = server_port or SERVER_PORT
+    url = f"http://{host}:{port}/stats"
+    
+    print_info(f"Getting statistics from {url}")
+    
+    try:
+        response = requests.get(url)
+        
+        if response.status_code == 200:
+            stats = response.json()
+            print_success("Transfer Statistics:")
+            print(f"  Total Transfers: {stats.get('total_transfers', 0)}")
+            print(f"  Total Size: {stats.get('total_size_mb', 0):.2f} MB")
+            print(f"  Completed: {stats.get('completed_count', 0)}")
+            print(f"  Failed: {stats.get('failed_count', 0)}")
+            print(f"  Active: {stats.get('active_count', 0)}")
+            print(f"  Success Rate: {stats.get('success_rate', 0):.1f}%")
+            print(f"  Average Speed: {stats.get('average_speed_mbps', 0):.2f} MB/s")
+            print(f"  Total Clients: {stats.get('total_clients', 0)}")
+            print(f"  Encrypted Files: {stats.get('encrypted_count', 0)}")
+            
+            if stats.get('file_types'):
+                print("  File Types:")
+                for ext, count in stats['file_types'].items():
+                    print(f"    {ext or 'no extension'}: {count}")
+            
+            return True
+        else:
+            print_error(f"Statistics request failed: {response.status_code}")
+            return False
+            
+    except Exception as e:
+        print_error(f"Statistics error: {e}")
+        return False
+
+
+def get_metadata(filename, server_host=None, server_port=None):
+    """Get file metadata."""
+    host = server_host or SERVER_HOST
+    port = server_port or SERVER_PORT
+    url = f"http://{host}:{port}/metadata/{filename}"
+    
+    print_info(f"Getting metadata for {filename}")
+    
+    try:
+        response = requests.get(url)
+        
+        if response.status_code == 200:
+            metadata = response.json()
+            print_success(f"Metadata for {filename}:")
+            print(f"  Size: {format_size(metadata.get('size', 0))}")
+            print(f"  Type: {metadata.get('mime_type', 'unknown')}")
+            print(f"  Extension: {metadata.get('extension', 'none')}")
+            print(f"  Created: {metadata.get('created', 'unknown')}")
+            print(f"  Modified: {metadata.get('modified', 'unknown')}")
+            
+            if metadata.get('thumbnail'):
+                print(f"  Thumbnail: {metadata['thumbnail']}")
+            
+            return True
+        else:
+            print_error(f"Metadata request failed: {response.status_code}")
+            return False
+            
+    except Exception as e:
+        print_error(f"Metadata error: {e}")
+        return False
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Smart File Transfer Client',
@@ -602,6 +793,31 @@ if __name__ == '__main__':
     
     # Health check command
     health_parser = subparsers.add_parser('health', help='Check server health')
+    
+    # Batch upload command
+    batch_parser = subparsers.add_parser('batch', help='Upload multiple files')
+    batch_parser.add_argument('files', nargs='+', help='Files to upload')
+    batch_parser.add_argument('--encrypt', action='store_true', help='Encrypt files during upload')
+    batch_parser.add_argument('--priority', type=int, default=0, help='Transfer priority (0-10)')
+    
+    # Cancel command
+    cancel_parser = subparsers.add_parser('cancel', help='Cancel a transfer')
+    cancel_parser.add_argument('filename', help='File to cancel')
+    
+    # History command
+    history_parser = subparsers.add_parser('history', help='Get transfer history')
+    history_parser.add_argument('--status', help='Filter by status')
+    history_parser.add_argument('--client', help='Filter by client IP')
+    history_parser.add_argument('--from', dest='from_date', help='From date (YYYY-MM-DD)')
+    history_parser.add_argument('--to', dest='to_date', help='To date (YYYY-MM-DD)')
+    history_parser.add_argument('--limit', type=int, default=100, help='Limit results')
+    
+    # Stats command
+    stats_parser = subparsers.add_parser('stats', help='Get transfer statistics')
+    
+    # Metadata command
+    metadata_parser = subparsers.add_parser('metadata', help='Get file metadata')
+    metadata_parser.add_argument('filename', help='File to get metadata for')
     
     args = parser.parse_args()
     
@@ -652,6 +868,46 @@ if __name__ == '__main__':
     
     elif args.command == 'health':
         success = health_check(
+            server_host=args.server,
+            server_port=args.port
+        )
+    
+    elif args.command == 'batch':
+        success = upload_batch(
+            args.files,
+            encrypt=args.encrypt,
+            priority=args.priority,
+            server_host=args.server,
+            server_port=args.port
+        )
+    
+    elif args.command == 'cancel':
+        success = cancel_transfer(
+            args.filename,
+            server_host=args.server,
+            server_port=args.port
+        )
+    
+    elif args.command == 'history':
+        success = get_history(
+            status=args.status,
+            client=args.client,
+            from_date=args.from_date,
+            to_date=args.to_date,
+            limit=args.limit,
+            server_host=args.server,
+            server_port=args.port
+        )
+    
+    elif args.command == 'stats':
+        success = get_statistics(
+            server_host=args.server,
+            server_port=args.port
+        )
+    
+    elif args.command == 'metadata':
+        success = get_metadata(
+            args.filename,
             server_host=args.server,
             server_port=args.port
         )

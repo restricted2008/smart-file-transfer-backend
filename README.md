@@ -4,6 +4,7 @@ A secure, feature-rich file transfer server with encryption support, priority qu
 
 ## Features
 
+### Core Transfer Features
 - 🔐 **AES-128-EAX Encryption** - Optional end-to-end file encryption
 - 📊 **Live Progress Tracking** - Real-time upload/download progress with speed and ETA
 - 🧩 **Chunked Upload/Download** - Break large files into chunks with resume capability
@@ -13,6 +14,17 @@ A secure, feature-rich file transfer server with encryption support, priority qu
 - ⚡ **Speed Tracking** - Display transfer speed in MB/s with network quality assessment
 - 💾 **Queue Persistence** - Transfer queue survives server restarts
 - 🎯 **Priority Queue** - Transfer priority management
+
+### Advanced Features
+- 🔌 **WebSocket Real-Time Notifications** - Live updates via WebSocket connections
+- 📦 **Batch File Operations** - Upload/download multiple files in one request
+- ❌ **Transfer Cancellation** - Cancel ongoing transfers mid-upload
+- 🖼️ **File Metadata & Thumbnails** - Rich file information with image thumbnails
+- 📈 **Transfer History** - Filterable transfer history with date and client filters
+- 🔑 **API Key Authentication** - Secure access with API key authentication
+- 📊 **Transfer Statistics** - Comprehensive analytics and performance metrics
+
+### Security & Reliability
 - 🔒 **Thread-safe** - Concurrent access with file locking
 - ✅ **Checksums** - SHA-256 file integrity verification
 - 🌐 **CORS Support** - Ready for frontend integration
@@ -22,7 +34,7 @@ A secure, feature-rich file transfer server with encryption support, priority qu
 
 ```
 backend/
-├── server.py              # Flask HTTP API server
+├── server.py              # Flask HTTP API server with WebSocket support
 ├── client.py              # CLI client for testing
 ├── config.py              # Configuration management
 ├── requirements.txt       # Python dependencies
@@ -33,6 +45,7 @@ backend/
     ├── encrypt_util.py    # AES-128-EAX encryption
     ├── status_handler.py  # Thread-safe status management
     ├── progress_tracker.py # Live progress tracking utilities
+    ├── metadata_util.py   # File metadata and thumbnail generation
     └── auto_restart.py    # Auto-restart monitor
 ```
 
@@ -329,6 +342,211 @@ Client pings to measure latency and network quality.
 }
 ```
 
+---
+
+### `POST /upload_batch`
+Upload multiple files in one request.
+
+**Headers:**
+- `X-API-Key`: API key for authentication (required)
+
+**Request (multipart/form-data):**
+- `files`: Multiple files to upload (required)
+- `encryption`: Enable encryption - `true`/`false` (default: `false`)
+- `priority`: Transfer priority 0-10 (default: 0)
+- `client_id`: Custom client identifier (optional)
+
+**Response (200 OK):**
+```json
+{
+  "success": true,
+  "total_files": 3,
+  "successful": 3,
+  "failed": 0,
+  "results": [
+    {
+      "filename": "file1.txt",
+      "status": "success",
+      "hash": "abc123...",
+      "size": 1024,
+      "metadata": {...}
+    }
+  ]
+}
+```
+
+---
+
+### `POST /download_batch`
+Download multiple files as a ZIP archive.
+
+**Headers:**
+- `X-API-Key`: API key for authentication (required)
+
+**Request (JSON):**
+```json
+{
+  "filenames": ["file1.txt", "file2.pdf", "file3.jpg"]
+}
+```
+
+**Response (200 OK):**
+ZIP file stream with `Content-Type: application/zip`
+
+---
+
+### `POST /cancel/<filename>`
+Cancel an ongoing transfer.
+
+**Headers:**
+- `X-API-Key`: API key for authentication (required)
+
+**Response (200 OK):**
+```json
+{
+  "success": true,
+  "message": "file.txt cancelled"
+}
+```
+
+---
+
+### `GET /metadata/<filename>`
+Get file metadata including thumbnail.
+
+**Response (200 OK):**
+```json
+{
+  "filename": "image.jpg",
+  "size": 1048576,
+  "created": "2024-10-24T07:30:00",
+  "modified": "2024-10-24T07:30:05",
+  "mime_type": "image/jpeg",
+  "extension": ".jpg",
+  "thumbnail": "image.jpg.thumb.jpg"
+}
+```
+
+---
+
+### `GET /thumbnail/<filename>`
+Serve thumbnail image.
+
+**Response (200 OK):**
+JPEG image stream with `Content-Type: image/jpeg`
+
+---
+
+### `GET /history`
+Get transfer history with optional filters.
+
+**Query Parameters:**
+- `status`: Filter by status (completed, failed, uploading, etc.)
+- `client`: Filter by client IP
+- `from`: From date (YYYY-MM-DD)
+- `to`: To date (YYYY-MM-DD)
+- `limit`: Maximum results (default: 100)
+- `offset`: Skip results (default: 0)
+
+**Response (200 OK):**
+```json
+{
+  "transfers": {
+    "file1.txt": {
+      "status": "completed",
+      "client_ip": "192.168.1.100",
+      "created_at": "2024-10-24T07:30:00"
+    }
+  },
+  "total_count": 50,
+  "returned_count": 10,
+  "offset": 0,
+  "limit": 100
+}
+```
+
+---
+
+### `GET /stats`
+Get comprehensive transfer statistics.
+
+**Response (200 OK):**
+```json
+{
+  "total_transfers": 100,
+  "total_bytes": 104857600,
+  "total_size_mb": 100.0,
+  "completed_count": 95,
+  "failed_count": 5,
+  "active_count": 0,
+  "success_rate": 95.0,
+  "average_speed_mbps": 10.5,
+  "total_clients": 15,
+  "file_types": {
+    ".txt": 30,
+    ".pdf": 20,
+    ".jpg": 25
+  },
+  "encrypted_count": 40,
+  "queue_length": 0
+}
+```
+
+---
+
+### `POST /generate_key`
+Generate a new API key (admin only).
+
+**Response (200 OK):**
+```json
+{
+  "api_key": "new_generated_key_here"
+}
+```
+
+---
+
+## WebSocket Events
+
+### Connection
+```javascript
+const socket = io('http://localhost:8080');
+
+socket.on('connect', () => {
+  console.log('Connected to file transfer server');
+});
+```
+
+### Subscribe to File Updates
+```javascript
+// Subscribe to specific file
+socket.emit('subscribe_status', { filename: 'document.pdf' });
+
+// Subscribe to all transfers
+socket.emit('subscribe_all');
+
+// Subscribe to statistics
+socket.emit('subscribe_stats');
+```
+
+### Event Handlers
+```javascript
+// File status updates
+socket.on('status_update', (data) => {
+  console.log('File update:', data.progress, '%');
+});
+
+// Transfer updates
+socket.on('transfer_update', (data) => {
+  console.log('Transfer update:', data.filename, data.progress);
+});
+
+// Statistics updates
+socket.on('stats_update', (stats) => {
+  console.log('Stats update:', stats.total_transfers);
+});
+```
+
 ## Testing
 
 ### Unit Tests
@@ -450,6 +668,24 @@ python client.py download nonexistent.txt
 # (stop server first)
 python client.py upload test.txt
 # Should show connection error with helpful message
+```
+
+**5. Test new features:**
+```bash
+# Batch upload multiple files
+python client.py batch file1.txt file2.txt file3.txt --encrypt
+
+# Cancel a transfer
+python client.py cancel large_file.bin
+
+# Get transfer history
+python client.py history --status completed --limit 10
+
+# Get statistics
+python client.py stats
+
+# Get file metadata
+python client.py metadata image.jpg
 ```
 
 ## Configuration
@@ -1110,6 +1346,18 @@ MIT License - see LICENSE file for details.
 For issues, questions, or contributions, please open an issue or submit a pull request.
 
 ## Changelog
+
+### v3.0.0 (2024-10-25)
+- 🆕 **WebSocket Real-Time Notifications** - Live updates via WebSocket connections
+- 🆕 **Batch File Operations** - Upload/download multiple files in one request
+- 🆕 **Transfer Cancellation** - Cancel ongoing transfers mid-upload
+- 🆕 **File Metadata & Thumbnails** - Rich file information with image thumbnails
+- 🆕 **Transfer History** - Filterable transfer history with date and client filters
+- 🆕 **API Key Authentication** - Secure access with API key authentication
+- 🆕 **Transfer Statistics** - Comprehensive analytics and performance metrics
+- 🆕 **Enhanced Client CLI** - New commands for batch operations, cancellation, history, stats, and metadata
+- 🆕 **New API Endpoints** - `/upload_batch`, `/download_batch`, `/cancel`, `/metadata`, `/thumbnail`, `/history`, `/stats`, `/generate_key`
+- 🆕 **Comprehensive Testing** - Updated test suite for all new features
 
 ### v2.0.0 (2024-10-25)
 - 🆕 **Live Progress Tracking** - Real-time upload/download progress with speed and ETA

@@ -4,14 +4,19 @@ Main multi-client HTTP API server with POST/GET endpoints for file transfers.
 Handles file uploads, downloads, and status queries with encryption support.
 """
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit, join_room, leave_room
 import os
 import sys
 import time
-import traceback
+import threading
+import zipfile
+import io
+import secrets
 from datetime import datetime
 from werkzeug.utils import secure_filename
+from functools import wraps
 
 # Import configuration and utilities
 from config import (
@@ -28,6 +33,7 @@ from utils.hash_util import file_checksum
 from utils.encrypt_util import encrypt_data, decrypt_data
 from utils.status_handler import StatusHandler
 from utils.progress_tracker import ProgressTracker, NetworkMonitor, format_speed, format_eta
+from utils.metadata_util import get_file_metadata, generate_thumbnail, get_file_type_category, format_file_size
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -37,9 +43,12 @@ CORS(app, resources={
     r"/*": {
         "origins": ["http://localhost:*", "http://127.0.0.1:*"],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
+        "allow_headers": ["Content-Type", "Authorization", "X-API-Key"]
     }
 })
+
+# Initialize SocketIO for WebSocket support
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # Configure max upload size
 app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
@@ -47,6 +56,13 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 # Initialize status handler and network monitor
 status_handler = StatusHandler()
 network_monitor = NetworkMonitor()
+
+# Authentication
+API_KEYS = set(os.environ.get('API_KEYS', 'dev-key-123,hackathon-key-456').split(','))
+
+# Transfer cancellation tracking
+cancellation_flags = {}
+cancellation_lock = threading.Lock()
 
 
 def log_error(message, exception=None):
@@ -61,6 +77,34 @@ def log_info(message):
     """Log info messages with timestamp."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] INFO: {message}")
+
+
+def require_api_key(f):
+    """Decorator to require API key for endpoint access."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        api_key = request.headers.get('X-API-Key')
+        
+        if not api_key:
+            return jsonify({'error': 'API key required'}), 401
+        
+        if api_key not in API_KEYS:
+            return jsonify({'error': 'Invalid API key'}), 403
+        
+        return f(*args, **kwargs)
+    return decorated
+
+
+def is_cancelled(filename):
+    """Check if transfer should be cancelled."""
+    with cancellation_lock:
+        return cancellation_flags.get(filename, False)
+
+
+def set_cancelled(filename, cancelled=True):
+    """Set cancellation flag for file."""
+    with cancellation_lock:
+        cancellation_flags[filename] = cancelled
 
 
 def upload_with_progress(file_stream, filename, total_size, client_ip=None, client_agent=None, client_id=None):
@@ -105,6 +149,27 @@ def upload_with_progress(file_stream, filename, total_size, client_ip=None, clie
     try:
         with open(temp_filepath, 'wb') as f:
             while True:
+                # Check if cancelled
+                if is_cancelled(filename):
+                    # Cleanup partial file
+                    f.close()
+                    if os.path.exists(temp_filepath):
+                        os.remove(temp_filepath)
+                    
+                    status_handler.update_status(filename, 'cancelled')
+                    
+                    # Clear cancellation flag
+                    set_cancelled(filename, False)
+                    
+                    # Emit WebSocket notification
+                    socketio.emit('status_update', {
+                        'filename': filename,
+                        'status': 'cancelled',
+                        'progress': 0
+                    }, room=filename)
+                    
+                    raise Exception(f'Transfer cancelled by user')
+                
                 chunk = file_stream.read(chunk_size)
                 if not chunk:
                     break
@@ -126,6 +191,23 @@ def upload_with_progress(file_stream, filename, total_size, client_ip=None, clie
                         transferred_bytes=received,
                         total_bytes=total_size
                     )
+                    
+                    # Emit WebSocket notification
+                    socketio.emit('status_update', {
+                        'filename': filename,
+                        'status': 'uploading',
+                        'progress': progress_data['progress'],
+                        'speed': progress_data['speed'],
+                        'eta': progress_data['eta'],
+                        'transferred_bytes': received,
+                        'total_bytes': total_size
+                    }, room=filename)
+                    
+                    # Also emit to global room
+                    socketio.emit('transfer_update', {
+                        'filename': filename,
+                        'progress': progress_data['progress']
+                    }, room='all_transfers')
         
         # Final progress update
         final_progress = progress_tracker.update(received)
@@ -570,6 +652,344 @@ def ping():
         return jsonify({'error': f'Ping failed: {str(e)}'}), 500
 
 
+@app.route('/upload_batch', methods=['POST'])
+@require_api_key
+def upload_batch():
+    """Upload multiple files in one request."""
+    files = request.files.getlist('files')
+    
+    if not files:
+        return jsonify({'error': 'No files provided'}), 400
+    
+    results = []
+    encryption = request.form.get('encryption', 'false').lower() == 'true'
+    priority = int(request.form.get('priority', 0))
+    client_ip = request.remote_addr
+    client_agent = request.headers.get('User-Agent')
+    client_id = request.form.get('client_id')
+    
+    for file in files:
+        try:
+            filename = secure_filename(file.filename)
+            if not filename:
+                results.append({
+                    'filename': file.filename,
+                    'status': 'failed',
+                    'error': 'Invalid filename'
+                })
+                continue
+            
+            filepath = os.path.join(UPLOAD_DIR, filename)
+            
+            # Save file
+            file.save(filepath)
+            
+            # Calculate hash
+            checksum = file_checksum(filepath)
+            
+            # Encrypt if requested
+            if encryption:
+                encrypt_data(filepath, ENCRYPTION_KEY)
+                filename += '.enc'
+                os.rename(filepath, os.path.join(UPLOAD_DIR, filename))
+                filepath = os.path.join(UPLOAD_DIR, filename)
+            
+            # Get file metadata
+            metadata = get_file_metadata(filepath)
+            
+            # Update status
+            status_handler.update_status(
+                filename=filename,
+                status='completed',
+                checksum=checksum,
+                encryption=encryption,
+                priority=priority,
+                client_ip=client_ip,
+                client_agent=client_agent,
+                client_id=client_id,
+                total_bytes=os.path.getsize(filepath)
+            )
+            
+            results.append({
+                'filename': filename,
+                'status': 'success',
+                'hash': checksum,
+                'size': os.path.getsize(filepath),
+                'metadata': metadata
+            })
+            
+            # Emit WebSocket notification
+            socketio.emit('batch_upload_complete', {
+                'filename': filename,
+                'status': 'completed'
+            }, room='all_transfers')
+            
+        except Exception as e:
+            results.append({
+                'filename': file.filename,
+                'status': 'failed',
+                'error': str(e)
+            })
+    
+    return jsonify({
+        'success': True,
+        'total_files': len(files),
+        'successful': len([r for r in results if r['status'] == 'success']),
+        'failed': len([r for r in results if r['status'] == 'failed']),
+        'results': results
+    }), 200
+
+
+@app.route('/download_batch', methods=['POST'])
+@require_api_key
+def download_batch():
+    """Download multiple files as a ZIP archive."""
+    filenames = request.json.get('filenames', [])
+    
+    if not filenames:
+        return jsonify({'error': 'No filenames provided'}), 400
+    
+    # Create ZIP archive in memory
+    zip_buffer = io.BytesIO()
+    
+    try:
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for filename in filenames:
+                filepath = os.path.join(UPLOAD_DIR, filename)
+                
+                if not os.path.exists(filepath):
+                    continue  # Skip missing files
+                
+                # Decrypt if encrypted
+                if filename.endswith('.enc'):
+                    decrypted_data = decrypt_data(filepath, ENCRYPTION_KEY)
+                    zip_file.writestr(filename[:-4], decrypted_data)
+                else:
+                    zip_file.write(filepath, filename)
+        
+        zip_buffer.seek(0)
+        
+        return send_file(
+            zip_buffer,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f'batch_download_{len(filenames)}_files.zip'
+        )
+        
+    except Exception as e:
+        return jsonify({'error': f'Batch download failed: {str(e)}'}), 500
+
+
+@app.route('/cancel/<filename>', methods=['POST'])
+@require_api_key
+def cancel_transfer(filename):
+    """Cancel an ongoing transfer."""
+    set_cancelled(filename, True)
+    
+    # Update status
+    status_handler.update_status(filename, 'cancelled', progress=0)
+    
+    # Emit WebSocket event
+    socketio.emit('status_update', {
+        'filename': filename,
+        'status': 'cancelled'
+    }, room=filename)
+    
+    return jsonify({'success': True, 'message': f'{filename} cancelled'}), 200
+
+
+@app.route('/metadata/<filename>', methods=['GET'])
+def get_metadata(filename):
+    """Get file metadata including thumbnail."""
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    
+    if not os.path.exists(filepath):
+        return jsonify({'error': 'File not found'}), 404
+    
+    metadata = get_file_metadata(filepath)
+    return jsonify(metadata), 200
+
+
+@app.route('/thumbnail/<filename>', methods=['GET'])
+def get_thumbnail(filename):
+    """Serve thumbnail image."""
+    thumb_path = os.path.join(UPLOAD_DIR, filename + '.thumb.jpg')
+    
+    if not os.path.exists(thumb_path):
+        return jsonify({'error': 'Thumbnail not found'}), 404
+    
+    return send_file(thumb_path, mimetype='image/jpeg')
+
+
+@app.route('/history', methods=['GET'])
+def get_history():
+    """Get transfer history with optional filters."""
+    # Parse query parameters
+    status_filter = request.args.get('status')  # completed, failed, uploading, etc.
+    client_ip = request.args.get('client')
+    from_date = request.args.get('from')  # ISO format: 2025-10-20
+    to_date = request.args.get('to')
+    limit = int(request.args.get('limit', 100))
+    offset = int(request.args.get('offset', 0))
+    
+    # Get all transfers
+    all_data = status_handler._read_data()
+    transfers = all_data.get('transfers', {})
+    filtered = {}
+    
+    # Apply filters
+    for filename, info in transfers.items():
+        # Status filter
+        if status_filter and info.get('status') != status_filter:
+            continue
+        
+        # Client IP filter
+        if client_ip and info.get('client_ip') != client_ip:
+            continue
+        
+        # Date range filter
+        created_at = info.get('created_at')
+        if created_at:
+            try:
+                created_dt = datetime.fromisoformat(created_at)
+                
+                if from_date:
+                    from_dt = datetime.fromisoformat(from_date)
+                    if created_dt < from_dt:
+                        continue
+                
+                if to_date:
+                    to_dt = datetime.fromisoformat(to_date)
+                    if created_dt > to_dt:
+                        continue
+            except:
+                pass
+        
+        filtered[filename] = info
+    
+    # Sort by created_at (newest first)
+    sorted_items = sorted(
+        filtered.items(),
+        key=lambda x: x[1].get('created_at', ''),
+        reverse=True
+    )
+    
+    # Apply pagination
+    paginated = dict(sorted_items[offset:offset + limit])
+    
+    return jsonify({
+        'transfers': paginated,
+        'total_count': len(filtered),
+        'returned_count': len(paginated),
+        'offset': offset,
+        'limit': limit
+    }), 200
+
+
+@app.route('/stats', methods=['GET'])
+def get_statistics():
+    """Get comprehensive transfer statistics."""
+    all_data = status_handler._read_data()
+    transfers = all_data.get('transfers', {})
+    
+    if not transfers:
+        return jsonify({
+            'total_transfers': 0,
+            'message': 'No transfers yet'
+        }), 200
+    
+    # Calculate metrics
+    total_bytes = sum(t.get('total_bytes', 0) for t in transfers.values())
+    completed = [t for t in transfers.values() if t.get('status') == 'completed']
+    failed = [t for t in transfers.values() if t.get('status') == 'failed']
+    active = [t for t in transfers.values() if t.get('status') in ['uploading', 'downloading']]
+    
+    speeds = [t.get('speed', 0) for t in transfers.values() if t.get('speed', 0) > 0]
+    avg_speed = sum(speeds) / len(speeds) if speeds else 0
+    
+    unique_clients = set(t.get('client_ip') for t in transfers.values() if t.get('client_ip'))
+    
+    # File type distribution
+    file_types = {}
+    for t in transfers.values():
+        ext = os.path.splitext(t.get('filename', ''))[1]
+        file_types[ext] = file_types.get(ext, 0) + 1
+    
+    return jsonify({
+        'total_transfers': len(transfers),
+        'total_bytes': total_bytes,
+        'total_size_mb': round(total_bytes / (1024 * 1024), 2),
+        'completed_count': len(completed),
+        'failed_count': len(failed),
+        'active_count': len(active),
+        'success_rate': round((len(completed) / len(transfers)) * 100, 2),
+        'average_speed_mbps': round(avg_speed / (1024 * 1024), 2),
+        'total_clients': len(unique_clients),
+        'file_types': file_types,
+        'encrypted_count': sum(1 for t in transfers.values() if t.get('encryption')),
+        'queue_length': len(all_data.get('queue', []))
+    }), 200
+
+
+@app.route('/generate_key', methods=['POST'])
+def generate_api_key():
+    """Generate a new API key (admin only)."""
+    new_key = secrets.token_urlsafe(32)
+    return jsonify({'api_key': new_key}), 200
+
+
+# WebSocket Event Handlers
+@socketio.on('connect')
+def handle_connect():
+    """Client connects to WebSocket."""
+    print(f'Client connected: {request.sid}')
+    emit('connected', {'message': 'Connected to file transfer server'})
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Client disconnects."""
+    print(f'Client disconnected: {request.sid}')
+
+
+@socketio.on('subscribe_status')
+def handle_subscribe(data):
+    """Client subscribes to specific file status updates."""
+    filename = data.get('filename')
+    join_room(filename)  # Join room for this file
+    
+    # Send current status immediately
+    status = status_handler.get_status(filename)
+    if status:
+        emit('status_update', status, room=request.sid)
+    else:
+        emit('error', {'message': f'File {filename} not found'}, room=request.sid)
+
+
+@socketio.on('unsubscribe_status')
+def handle_unsubscribe(data):
+    """Client unsubscribes from file updates."""
+    filename = data.get('filename')
+    leave_room(filename)
+
+
+@socketio.on('subscribe_all')
+def handle_subscribe_all():
+    """Subscribe to all transfer updates."""
+    join_room('all_transfers')
+    all_status = status_handler.get_all_status()
+    emit('status_update', all_status, room=request.sid)
+
+
+@socketio.on('subscribe_stats')
+def handle_subscribe_stats():
+    """Subscribe to real-time statistics updates."""
+    join_room('stats')
+    # Send current stats immediately
+    stats = get_statistics()
+    emit('stats_update', stats.json if hasattr(stats, 'json') else stats, room=request.sid)
+
+
 @app.route('/status', methods=['GET'])
 def get_all_status():
     """
@@ -822,6 +1242,18 @@ def internal_error(error):
     }), 500
 
 
+def emit_stats_periodically():
+    """Emit statistics every 5 seconds to subscribed clients."""
+    while True:
+        time.sleep(5)
+        with app.app_context():
+            try:
+                stats = get_statistics()
+                socketio.emit('stats_update', stats.json if hasattr(stats, 'json') else stats, room='stats')
+            except Exception as e:
+                print(f"Error emitting stats: {e}")
+
+
 if __name__ == '__main__':
     # Ensure all required directories exist
     try:
@@ -833,6 +1265,10 @@ if __name__ == '__main__':
         log_error("Failed to create storage directories", e)
         sys.exit(1)
     
+    # Start background thread for periodic stats
+    stats_thread = threading.Thread(target=emit_stats_periodically, daemon=True)
+    stats_thread.start()
+    
     log_info("=" * 60)
     log_info("Smart File Transfer Server")
     log_info(f"Host: {SERVER_HOST}")
@@ -840,12 +1276,9 @@ if __name__ == '__main__':
     log_info(f"Upload Directory: {UPLOAD_DIR}")
     log_info(f"Max File Size: {MAX_FILE_SIZE / (1024*1024):.2f} MB")
     log_info(f"Encryption: Enabled (AES-128-EAX)")
+    log_info(f"WebSocket: Enabled (Flask-SocketIO)")
     log_info("=" * 60)
     
-    # Start Flask server
-    app.run(
-        host=SERVER_HOST,
-        port=SERVER_PORT,
-        threaded=True,
-        debug=False  # Set to True for development
-    )
+    # Start SocketIO server
+    port = int(os.environ.get('PORT', SERVER_PORT))
+    socketio.run(app, host=SERVER_HOST, port=port, debug=True)
