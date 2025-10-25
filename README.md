@@ -30,6 +30,87 @@ A secure, feature-rich file transfer server with encryption support, priority qu
 - 🌐 **CORS Support** - Ready for frontend integration
 - 📝 **Comprehensive Logging** - Detailed error and event tracking
 
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        CLIENT LAYER                             │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │
+│  │ React        │  │ CLI Client   │  │ Mobile App   │         │
+│  │ Frontend     │  │ (client.py)  │  │ (Future)     │         │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘         │
+└─────────┼──────────────────┼──────────────────┼────────────────┘
+          │                  │                  │
+          └──────────────────┼──────────────────┘
+                             │
+┌─────────────────────────────────────────────────────────────────┐
+│                   CONNECTION LAYER                              │
+│                                                                 │
+│         HTTP/REST APIs          WebSocket (Real-time)          │
+│         └─ /upload              └─ status_update               │
+│         └─ /download            └─ transfer_update             │
+│         └─ /status              └─ stats_update                │
+│         └─ /cancel                                             │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────────────────────────────────────────┐
+│                    FLASK BACKEND SERVER                         │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  API Endpoints (server.py)                              │   │
+│  │  /upload /download /status /cancel /batch /stats        │   │
+│  └────────────────────────┬────────────────────────────────┘   │
+│                           │                                     │
+│  ┌────────────────────────┴────────────────────────────────┐   │
+│  │  Core Services                                          │   │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐│   │
+│  │  │ Encrypt  │  │  Hash    │  │ Progress │  │ Status  ││   │
+│  │  │ Util     │  │  Util    │  │ Tracker  │  │ Handler ││   │
+│  │  └──────────┘  └──────────┘  └──────────┘  └─────────┘│   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────────────────────────────────────────┐
+│                      STORAGE LAYER                              │
+│  ┌──────────────┐  ┌──────────────────┐  ┌─────────────────┐  │
+│  │ Local Disk   │  │ transfer_status  │  │ Priority Queue  │  │
+│  │ (storage/)   │  │ .json            │  │ Management      │  │
+│  │ - Uploads    │  │ - Metadata       │  │ - Persistence   │  │
+│  │ - Encrypted  │  │ - History        │  │ - Retry Logic   │  │
+│  │ - Thumbnails │  │ - Stats          │  │                 │  │
+│  └──────────────┘  └──────────────────┘  └─────────────────┘  │
+└─────────────────────────────┬───────────────────────────────────┘
+                              │
+┌─────────────────────────────────────────────────────────────────┐
+│              OPTIONAL CLOUD STORAGE (Future)                    │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│  │ AWS S3   │  │ Azure    │  │ Google   │  │ Dropbox  │       │
+│  │          │  │ Blob     │  │ Cloud    │  │ API      │       │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Key Data Flow
+
+The system processes file transfers through an 8-step pipeline:
+
+1. **Upload Request** - Client initiates file upload via HTTP POST with optional encryption flag
+2. **Chunking** - Large files (>5MB) are automatically split into manageable chunks for reliability
+3. **Integrity Check** - Each chunk is hashed using SHA-256 to verify data integrity
+4. **Encryption** (optional) - Files are encrypted using AES-128-EAX with authenticated encryption
+5. **Storage** - Chunks are written to disk with atomic operations and file locking
+6. **WebSocket Broadcast** - Real-time progress updates pushed to all subscribed clients
+7. **Queue Management** - Transfer added to priority queue with persistent state tracking
+8. **Download** - Files are streamed back to clients with optional decryption
+
+### Resilience Mechanisms
+
+The backend implements multiple resilience features:
+
+- **Resume on Failure** - Chunked uploads can resume from the last successful chunk using `/resume_info` endpoint
+- **Auto-Retry with exponential backoff** - Failed transfers retry automatically with increasing delays (1s, 2s, 4s, 8s, 16s)
+- **Network Monitoring with adaptive chunk sizing** - `/ping` endpoint monitors latency and adjusts chunk size based on network quality
+- **Transfer Cancellation** - In-flight transfers can be cancelled gracefully via `/cancel` endpoint
+
 ## Architecture
 
 ```
@@ -546,6 +627,296 @@ socket.on('stats_update', (stats) => {
   console.log('Stats update:', stats.total_transfers);
 });
 ```
+
+## Frontend Integration
+
+### Quick Setup (5 Minutes)
+
+**1. Install dependencies:**
+```bash
+npm install socket.io-client axios
+```
+
+**2. Complete React component example:**
+
+```jsx path=null start=null
+import React, { useState, useEffect } from 'react';
+import axios from 'axios';
+import io from 'socket.io-client';
+
+const FileUploader = () => {
+  const [file, setFile] = useState(null);
+  const [progress, setProgress] = useState(0);
+  const [speed, setSpeed] = useState(0);
+  const [eta, setEta] = useState(0);
+  const [encryption, setEncryption] = useState(false);
+  const [priority, setPriority] = useState(5);
+  const [status, setStatus] = useState('');
+  const [socket, setSocket] = useState(null);
+  const [isDragging, setIsDragging] = useState(false);
+
+  const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8080';
+  const API_KEY = process.env.REACT_APP_API_KEY;
+
+  useEffect(() => {
+    // Initialize WebSocket connection
+    const newSocket = io(API_URL);
+    setSocket(newSocket);
+
+    newSocket.on('connect', () => {
+      console.log('Connected to file transfer server');
+      newSocket.emit('subscribe_all');
+    });
+
+    newSocket.on('transfer_update', (data) => {
+      if (file && data.filename === file.name) {
+        setProgress(data.progress || 0);
+        setSpeed(data.speed || 0);
+        setEta(data.eta || 0);
+        setStatus(data.status || '');
+      }
+    });
+
+    return () => newSocket.close();
+  }, [API_URL, file]);
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = () => {
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const droppedFile = e.dataTransfer.files[0];
+    if (droppedFile) setFile(droppedFile);
+  };
+
+  const handleFileChange = (e) => {
+    setFile(e.target.files[0]);
+  };
+
+  const handleUpload = async () => {
+    if (!file) {
+      alert('Please select a file first');
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('encryption', encryption);
+    formData.append('priority', priority);
+
+    try {
+      setStatus('uploading');
+      const response = await axios.post(`${API_URL}/upload`, formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data',
+          'X-API-Key': API_KEY
+        },
+        onUploadProgress: (progressEvent) => {
+          const percentCompleted = Math.round(
+            (progressEvent.loaded * 100) / progressEvent.total
+          );
+          setProgress(percentCompleted);
+        }
+      });
+
+      setStatus('completed');
+      console.log('Upload successful:', response.data);
+      alert(`File uploaded successfully: ${response.data.filename}`);
+    } catch (error) {
+      setStatus('failed');
+      console.error('Upload failed:', error);
+      alert(`Upload failed: ${error.response?.data?.message || error.message}`);
+    }
+  };
+
+  const formatSpeed = (bytesPerSecond) => {
+    return (bytesPerSecond / (1024 * 1024)).toFixed(2) + ' MB/s';
+  };
+
+  const formatTime = (seconds) => {
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${minutes}m ${secs}s`;
+  };
+
+  return (
+    <div style={{ padding: '20px', maxWidth: '600px', margin: '0 auto' }}>
+      <h2>Smart File Transfer</h2>
+      
+      {/* Drag-and-drop zone */}
+      <div
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        style={{
+          border: `2px dashed ${isDragging ? '#007bff' : '#ccc'}`,
+          borderRadius: '8px',
+          padding: '40px',
+          textAlign: 'center',
+          backgroundColor: isDragging ? '#f0f8ff' : '#f9f9f9',
+          cursor: 'pointer',
+          marginBottom: '20px'
+        }}
+      >
+        <input
+          type="file"
+          onChange={handleFileChange}
+          style={{ display: 'none' }}
+          id="file-input"
+        />
+        <label htmlFor="file-input" style={{ cursor: 'pointer' }}>
+          {file ? (
+            <p>📄 {file.name} ({(file.size / (1024 * 1024)).toFixed(2)} MB)</p>
+          ) : (
+            <p>Drag and drop a file here, or click to select</p>
+          )}
+        </label>
+      </div>
+
+      {/* Options */}
+      <div style={{ marginBottom: '20px' }}>
+        <label style={{ display: 'block', marginBottom: '10px' }}>
+          <input
+            type="checkbox"
+            checked={encryption}
+            onChange={(e) => setEncryption(e.target.checked)}
+          />
+          🔐 Enable Encryption (AES-128)
+        </label>
+
+        <label style={{ display: 'block', marginBottom: '10px' }}>
+          ⚡ Priority (0-10):
+          <input
+            type="range"
+            min="0"
+            max="10"
+            value={priority}
+            onChange={(e) => setPriority(parseInt(e.target.value))}
+            style={{ marginLeft: '10px', width: '200px' }}
+          />
+          <span style={{ marginLeft: '10px' }}>{priority}</span>
+        </label>
+      </div>
+
+      {/* Upload button */}
+      <button
+        onClick={handleUpload}
+        disabled={!file || status === 'uploading'}
+        style={{
+          padding: '10px 20px',
+          backgroundColor: '#007bff',
+          color: 'white',
+          border: 'none',
+          borderRadius: '5px',
+          cursor: file && status !== 'uploading' ? 'pointer' : 'not-allowed',
+          fontSize: '16px',
+          width: '100%'
+        }}
+      >
+        {status === 'uploading' ? '⏳ Uploading...' : '📤 Upload File'}
+      </button>
+
+      {/* Progress bar */}
+      {status === 'uploading' && (
+        <div style={{ marginTop: '20px' }}>
+          <div
+            style={{
+              width: '100%',
+              backgroundColor: '#e0e0e0',
+              borderRadius: '10px',
+              overflow: 'hidden',
+              height: '30px'
+            }}
+          >
+            <div
+              style={{
+                width: `${progress}%`,
+                backgroundColor: '#28a745',
+                height: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: 'white',
+                fontWeight: 'bold',
+                transition: 'width 0.3s ease'
+              }}
+            >
+              {progress}%
+            </div>
+          </div>
+          
+          {speed > 0 && (
+            <p style={{ marginTop: '10px', textAlign: 'center' }}>
+              🚀 Speed: {formatSpeed(speed)} | ⏱️ ETA: {formatTime(eta)}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Status message */}
+      {status === 'completed' && (
+        <div style={{ marginTop: '20px', color: '#28a745', textAlign: 'center' }}>
+          ✅ Upload completed successfully!
+        </div>
+      )}
+      {status === 'failed' && (
+        <div style={{ marginTop: '20px', color: '#dc3545', textAlign: 'center' }}>
+          ❌ Upload failed. Please try again.
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default FileUploader;
+```
+
+**3. Start the backend:**
+```bash
+cd backend
+python server.py
+```
+
+**4. Access the API:**
+- **Base URL:** `http://localhost:8080`
+- **API Key:** Set in environment variables or config.py
+
+### Environment Variables (Frontend)
+
+Create a `.env` file in your frontend project root:
+
+```bash path=null start=null
+# Backend API Configuration
+REACT_APP_API_URL=http://localhost:8080
+REACT_APP_API_KEY=your_api_key_here
+
+# For production deployment
+# REACT_APP_API_URL=https://your-backend.herokuapp.com
+```
+
+### Full Frontend Repository (Coming Soon)
+
+A complete React frontend with advanced features is under development:
+
+**Planned Features:**
+- 🎨 **Drag-and-drop file upload** - Intuitive file selection with visual feedback
+- 📊 **Real-time progress tracking** - Live progress bars with speed and ETA
+- 📋 **Transfer history table** - Sortable and filterable transfer records
+- 📈 **Analytics dashboard** - Visual charts for transfer statistics
+- 🌓 **Dark/light theme toggle** - User preference persistence
+- 🔐 **Encryption controls** - Easy toggle for secure transfers
+- ⚡ **Priority management** - Visual priority selector with queue preview
+- 🔄 **Resume functionality** - Automatic retry and resume for failed transfers
+- 📱 **Responsive design** - Mobile-friendly interface
+- 🔔 **Push notifications** - Desktop notifications for completed transfers
 
 ## Testing
 
